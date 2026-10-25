@@ -55,6 +55,14 @@ hidden = [
     "Crypto",
     "Crypto.Cipher",
     "Crypto.Cipher.AES",
+    # 暗号化保存（pycryptodomex）
+    "Cryptodome",
+    "Cryptodome.Cipher",
+    "Cryptodome.Cipher.AES",
+    "Cryptodome.Protocol.KDF",
+    "Cryptodome.Hash",
+    "Cryptodome.Hash.SHA256",
+    "Cryptodome.Random",
 ]
 
 # ── datas（データファイル）───────────────────────────────────────────────

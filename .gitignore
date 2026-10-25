@@ -1,0 +1,12 @@
+# ビルド生成物
+build/
+dist/
+*.zip
+
+# 同梱バイナリ（build.py が自動ダウンロード）
+ffmpeg/
+yt-dlp.exe
+
+# Python
+__pycache__/
+*.pyc
