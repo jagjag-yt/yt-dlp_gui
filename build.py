@@ -24,7 +24,7 @@ from pathlib import Path
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 APP_NAME    = "ytdlp_gui"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 SCRIPT_DIR  = Path(__file__).resolve().parent
 DIST_DIR    = SCRIPT_DIR / "dist" / APP_NAME
 BUILD_DIR   = SCRIPT_DIR / "build"
@@ -64,7 +64,7 @@ def download_file(url: str, dest: Path, label: str = "",
     GitHub リリースに対応したダウンロード関数。
     - User-Agent を設定（未設定だと GitHub に弾かれる）
     - リダイレクトを追跡
-    - SSL エラー時は検証をスキップして再試行
+    - SSL エラー時は certifi の CA バンドルで再試行（検証は省略しない）
     - 最大 retries 回リトライ
     """
     label = label or dest.name
@@ -83,13 +83,17 @@ def download_file(url: str, dest: Path, label: str = "",
         print(f"  Downloading: {label}  (attempt {attempt}/{retries})")
         print(f"  URL: {url}")
         try:
-            # SSL コンテキスト（1回目は検証あり、2回目以降はスキップ）
-            if attempt == 1:
-                ctx = ssl.create_default_context()
-            else:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode    = ssl.CERT_NONE
+            # SSL コンテキスト（証明書検証は常に有効。2回目以降は
+            # OS の証明書ストアの代わりに certifi の CA バンドルを使う）
+            ctx = ssl.create_default_context()
+            if attempt > 1:
+                try:
+                    import importlib
+                    importlib.invalidate_caches()   # 直前の pip install を反映
+                    import certifi
+                    ctx = ssl.create_default_context(cafile=certifi.where())
+                except ImportError:
+                    pass
 
             req  = urllib.request.Request(url, headers=headers)
             tmp  = Path(str(dest) + ".tmp")

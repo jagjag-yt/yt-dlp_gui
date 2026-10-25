@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         yt-dlp GUI v1.4.0  –  完全版 動画ダウンローダー          ║
+║         yt-dlp GUI v1.4.1  –  完全版 動画ダウンローダー          ║
 ║  pip install yt-dlp                                          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -60,7 +60,7 @@ IS_WIN = sys.platform == "win32"
 # ─────────────────────────────────────────────────────────────
 #  定数
 # ─────────────────────────────────────────────────────────────
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 APP_TITLE   = f"yt-dlp GUI v{APP_VERSION}"
 CFG_PATH    = Path.home() / ".ytdlp_gui_config.json"
 
@@ -103,6 +103,9 @@ QUALITY_MAP = {
     "360p":     "[height<=360]",
 }
 POST_ACTIONS = ["何もしない", "フォルダを開く", "PCをスリープ", "PCをシャットダウン"]
+# yt-dlp がサムネイル埋め込みに対応している形式
+THUMB_VIDEO_FMTS = ("mp4", "mkv")
+THUMB_AUDIO_FMTS = ("mp3", "m4a", "flac")
 
 # ══════════════════════════════════════════════════════════════
 #  デザイントークン（design_handoff README 準拠）
@@ -263,9 +266,16 @@ def desktop_notify(title: str, msg: str):
             import ctypes
             ctypes.windll.user32.MessageBeep(0)
         elif sys.platform == "darwin":
-            os.system(f'osascript -e \'display notification "{msg}" with title "{title}"\'')
+            # 引数はシェルを通さず渡す（タイトル中の引用符で壊れないように）
+            subprocess.Popen(
+                ["osascript", "-e",
+                 "on run argv\n"
+                 "display notification (item 2 of argv) "
+                 "with title (item 1 of argv)\nend run",
+                 title, msg])
         else:
-            os.system(f'notify-send "{title}" "{msg}" 2>/dev/null')
+            subprocess.Popen(["notify-send", title, msg],
+                             stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
@@ -394,6 +404,10 @@ def decrypt_file(path: Path, password: str) -> Path:
         if out.exists():
             stem, suf = os.path.splitext(name)
             out = path.with_name(f"{stem} (復号){suf}")
+            n = 2
+            while out.exists():
+                out = path.with_name(f"{stem} (復号 {n}){suf}")
+                n += 1
         with open(out, "wb") as dst:
             remain = body
             while remain > 0:
@@ -521,6 +535,8 @@ class DownloadTask:
     duration:      str       = ""
     formats:       str       = ""
     out_files:     List[str] = field(default_factory=list)  # 完成ファイル（暗号化用）
+    last_error:    str       = ""      # yt-dlp が出した最後の ERROR 行
+    removed:       bool      = False   # キューから削除された（未開始なら実行しない）
     started:       Optional[datetime] = None
     finished:      Optional[datetime] = None
 
@@ -555,9 +571,11 @@ class Downloader:
                     pass
 
     def reset(self):
-        self._stop.clear()
-        with self._lock:
-            self._ydls.clear()
+        # 停止イベントは clear せず作り直す。停止前に起動したスレッド
+        # （リトライ待ち・セマフォ待ち）は古いイベントを見続けるので、
+        # 停止→即再試行しても同じタスクが二重にダウンロードされない。
+        # 実行中プロセスの登録（_ydls）は消さない（停止で kill できるように）。
+        self._stop = threading.Event()
         self._sem = threading.Semaphore(max(1, self.cfg["concurrent"]))
 
     # ── yt-dlp コマンドライン引数生成 ──────────────────────
@@ -620,6 +638,10 @@ class Downloader:
         if ffmpeg_dir.exists():
             cmd += ["--ffmpeg-location", str(ffmpeg_dir)]
 
+        # サムネイル埋め込み可否（yt-dlp は webm / wav への埋め込みに
+        # 対応しておらず、ファイルは保存できても終了コード 1 になる）
+        embed_thumb = bool(cfg["embed_thumbnail"])
+
         # ── フォーマット・変換 ────────────────────────────
         if mode == "audio":
             afmt = cfg["audio_fmt"]
@@ -629,6 +651,8 @@ class Downloader:
                 "--audio-format", afmt,
                 "--audio-quality", "0",
             ]
+            if afmt not in THUMB_AUDIO_FMTS:
+                embed_thumb = False
         else:
             vfmt    = cfg["video_fmt"]
             quality = cfg["quality"]
@@ -637,6 +661,10 @@ class Downloader:
             if vfmt == VIDEO_AUTO or vfmt == "auto":
                 # 自動: コンテナ変換なしで最高画質
                 cmd += ["-f", f"bestvideo{hfilter}+bestaudio/best"]
+                if embed_thumb:
+                    # VP9+Opus は既定だと webm に結合され埋め込めないため、
+                    # 結合時は mp4（不可なら mkv）を使う
+                    cmd += ["--merge-output-format", "mp4/mkv"]
             else:
                 if vfmt == "mp4":
                     fmt = (f"bestvideo{hfilter}[ext=mp4]+bestaudio[ext=m4a]"
@@ -652,6 +680,8 @@ class Downloader:
                     "--merge-output-format", vfmt,
                     "--remux-video", vfmt,
                 ]
+                if vfmt not in THUMB_VIDEO_FMTS:
+                    embed_thumb = False
 
         # ── プレイリスト ──────────────────────────────────
         if cfg["playlist"]:
@@ -660,7 +690,7 @@ class Downloader:
             cmd += ["--no-playlist"]
 
         # ── サムネイル ────────────────────────────────────
-        if cfg["embed_thumbnail"]:
+        if embed_thumb:
             cmd += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
 
         # ── 字幕 ─────────────────────────────────────────
@@ -728,17 +758,23 @@ class Downloader:
         return opts
 
     # ── 進捗行パース ─────────────────────────────────────
+    _PROG_PATTERN = re.compile(
+        r'\[download\]\s+([\d.]+)%'
+        r'(?:\s+of\s+~?\s*[\d.]+\s*[KMGT]?i?B)?'
+        r'(?:\s+at\s+(?:([\d.]+\s*[KMGT]?i?B/s)|Unknown\s+B/s))?'
+        r'(?:\s+ETA\s+([\d:]+))?')
+    _ERROR_PATTERN = re.compile(r'^ERROR:\s*(.+)$')
+
     @staticmethod
     def _parse_progress(line: str, task: DownloadTask) -> bool:
         """yt-dlp --newline の出力をパースして task を更新。更新あり→True"""
         # [download]  42.3% of  123.45MiB at  1.23MiB/s ETA 00:12
-        m = re.search(
-            r'\[download\]\s+([\d.]+)%\s+of\s+[\d.]+\s*\S+\s+at\s+([\d.]+\s*\S+/s)'
-            r'(?:\s+ETA\s+(\S+))?',
-            line)
+        # [download]  12.0% of ~  50.00MiB at  2.00MiB/s ETA 00:20 (frag 3/40)
+        # [download]   5.0% of  10.00MiB at  Unknown B/s ETA Unknown
+        m = Downloader._PROG_PATTERN.search(line)
         if m:
             task.progress = float(m.group(1))
-            task.speed    = m.group(2)
+            task.speed    = m.group(2) or ""
             task.eta      = m.group(3) or ""
             task.state    = TaskState.DOWNLOADING
             return True
@@ -808,8 +844,13 @@ class Downloader:
     # ── タスク実行 ────────────────────────────────────────
     def run_task(self, task: DownloadTask):
         """セマフォ制御付き。スレッドから呼ぶ。"""
+        # 起動時点の停止イベント・セマフォを握る（reset() で差し替わっても
+        # このスレッドは自分の世代の停止指示に従う）
+        stop = self._stop
         with self._sem:
-            if self._stop.is_set():
+            if task.removed:
+                return
+            if stop.is_set():
                 task.state = TaskState.PAUSED
                 self.q.put(("task_update", task))
                 return
@@ -818,7 +859,7 @@ class Downloader:
             max_retry     = self.cfg["retries"]
 
             for attempt in range(max_retry + 1):
-                if self._stop.is_set():
+                if stop.is_set():
                     task.state = TaskState.PAUSED
                     self.q.put(("task_update", task))
                     return
@@ -830,8 +871,13 @@ class Downloader:
                     self.q.put(("task_update", task))
                     self.q.put(("log",
                         f"[リトライ {attempt}/{max_retry}] {task.short_url()} — {wait}秒後"))
-                    time.sleep(wait)
+                    # 待機中でも停止ボタンにすぐ反応する
+                    if stop.wait(wait):
+                        task.state = TaskState.PAUSED
+                        self.q.put(("task_update", task))
+                        return
 
+                task.last_error = ""
                 try:
                     cmd = self._build_cmd(task)
                     self.q.put(("log", f"[CMD] {' '.join(str(c) for c in cmd[:8])} ..."))
@@ -854,10 +900,12 @@ class Downloader:
                     )
 
                     with self._lock:
-                        self._ydls[task.idx] = proc  # type: ignore[assignment]
+                        self._ydls[id(task)] = proc  # type: ignore[assignment]
+                    if stop.is_set():
+                        proc.kill()
 
                     for raw_line in proc.stdout:  # type: ignore[union-attr]
-                        if self._stop.is_set():
+                        if stop.is_set():
                             proc.kill()
                             break
                         line = decode_console_bytes(raw_line).rstrip()
@@ -875,6 +923,10 @@ class Downloader:
 
                         self._collect_out_file(line, task)
 
+                        em = self._ERROR_PATTERN.match(line)
+                        if em:
+                            task.last_error = em.group(1).strip()
+
                         if self._parse_progress(line, task):
                             self.q.put(("task_update", task))
                         if "ERROR" in line or "WARNING" in line:
@@ -884,7 +936,7 @@ class Downloader:
 
                     proc.wait()
 
-                    if self._stop.is_set():
+                    if stop.is_set():
                         task.state = TaskState.PAUSED
                         self.q.put(("task_update", task))
                         return
@@ -899,11 +951,12 @@ class Downloader:
                         return
                     else:
                         raise RuntimeError(
-                            f"yt-dlp 終了コード {proc.returncode}")
+                            task.last_error
+                            or f"yt-dlp 終了コード {proc.returncode}")
 
                 except Exception as e:
                     msg = str(e)
-                    if "cancelled" in msg.lower() or self._stop.is_set():
+                    if "cancelled" in msg.lower() or stop.is_set():
                         task.state = TaskState.PAUSED
                         self.q.put(("task_update", task))
                         return
@@ -917,7 +970,7 @@ class Downloader:
                     return
                 finally:
                     with self._lock:
-                        self._ydls.pop(task.idx, None)
+                        self._ydls.pop(id(task), None)
 
 # ══════════════════════════════════════════════════════════════
 #  テーマ管理
@@ -1087,7 +1140,9 @@ class PillButton(tk.Canvas):
             _rounded_rect_ids(self, 0, 0, self._wd-1, self._ht-1, r, fill=fill)
         self.create_text(self._wd//2, self._ht//2, text=self._text,
                          fill=txt, font=self._font)
-        self.configure(cursor="hand2" if self._enabled else "no")
+        # "no"（禁止カーソル）は Windows 専用。他 OS では起動時に TclError になる
+        self.configure(cursor="hand2" if self._enabled
+                       else ("no" if IS_WIN else "arrow"))
 
     def _on_enter(self, _):
         self._hover = True
@@ -1666,6 +1721,7 @@ class App:
 
     def _build_left_content(self):
         c = self.theme.c
+        self._sync_url_content()
         inner = self._left_scroll.inner
         for w in inner.winfo_children():
             w.destroy()
@@ -2420,8 +2476,6 @@ class App:
             self.cfg["save_dir"]    = self._save_var.get()
             self.cfg["time_start"]  = self._ts_var.get()
             self.cfg["time_end"]    = self._te_var.get()
-            self.cfg["concurrent"]  = self._concurrent_var.get()
-            self.cfg["retries"]     = self._retries_var.get()
             self.cfg["rate_limit"]  = self._rate_var.get()
             self.cfg["cookie_file"] = self._cookie_var.get()
             self.cfg["post_action"] = self._post_action_var.get()
@@ -2432,6 +2486,20 @@ class App:
                 self.cfg[k] = v.get()
         except tk.TclError:
             return
+        # Spinbox は空欄・文字入力で TclError になるので個別に検証し、
+        # 不正なら直前の値に戻す
+        for key, var, lo, hi in (("concurrent", self._concurrent_var, 1, 8),
+                                 ("retries",    self._retries_var,    0, 10)):
+            try:
+                val = max(lo, min(hi, int(var.get())))
+            except (tk.TclError, ValueError):
+                val = self.cfg[key]
+            self.cfg[key] = val
+            try:
+                if var.get() != val:
+                    var.set(val)
+            except tk.TclError:
+                var.set(val)
         self.cfg.save()
 
     # ══════════════════════════════════════════════════════
@@ -2724,11 +2792,14 @@ class App:
     # ══════════════════════════════════════════════════════
 
     def _start_download(self):
-        if not YT_DLP_OK:
-            messagebox.showerror(
-                "エラー",
-                "yt-dlp がインストールされていません。\n"
-                "pip install yt-dlp を実行してください。")
+        if resolve_ytdlp_cmd() is None:
+            if getattr(sys, "frozen", False):
+                msg = (f"yt-dlp.exe が見つかりません。\n"
+                       f"{APP_DIR} に yt-dlp.exe を配置してください。")
+            else:
+                msg = ("yt-dlp がインストールされていません。\n"
+                       "pip install yt-dlp を実行してください。")
+            messagebox.showerror("エラー", msg)
             return
 
         if self._updating:
@@ -3008,6 +3079,8 @@ class App:
             return
         if not self.tasks:
             return
+        for t in self.tasks:
+            t.removed = True
         self.tasks.clear()
         self._selected.clear()
         self._cleanup_partial_files()
@@ -3080,6 +3153,8 @@ class App:
             if i in self._selected and t.state not in (
                     TaskState.DOWNLOADING, TaskState.CONVERTING,
                     TaskState.RETRYING):
+                # 待機中のスレッドが後から実行しないよう印を付ける
+                t.removed = True
                 continue
             keep.append(t)
         self.tasks = keep
@@ -3087,6 +3162,8 @@ class App:
             t.idx = i
         self._selected.clear()
         self._refresh_queue_view()
+        # 残りがすべて終わっていれば完了扱いにする
+        self._check_all_done()
         self._update_overall()
         self._update_action_states()
 
@@ -3142,27 +3219,49 @@ class App:
         c = self.theme.c
         win.configure(bg=c["bg1"])
 
-        tk.Label(win, text="動画情報を取得中...",
-                 bg=c["bg1"], fg=c["text"],
-                 font=F(13, True),
-                 wraplength=P(480)).pack(padx=P(16), pady=(P(16), P(4)))
+        head_lbl = tk.Label(win, text="動画情報を取得中...",
+                            bg=c["bg1"], fg=c["text"],
+                            font=F(13, True),
+                            wraplength=P(480))
+        head_lbl.pack(padx=P(16), pady=(P(16), P(4)))
         tk.Label(win, text=url[:70],
                  bg=c["bg1"], fg=c["text2"],
                  font=F(10)).pack(padx=P(16))
 
-        self._thumb_label = tk.Label(win, bg=c["bg3"],
-                                     width=200, height=120)
-        self._thumb_label.pack(pady=P(8))
+        # サムネイル枠（Pillow がある場合のみ）。Label の width/height は
+        # 画像が無いと文字数単位になり巨大化するため、ピクセル固定の枠に入れる
+        thumb_label = None
+        if PIL_OK:
+            thumb_box = tk.Frame(win, bg=c["bg3"],
+                                 width=P(200), height=P(120))
+            thumb_box.pack(pady=P(8))
+            thumb_box.pack_propagate(False)
+            thumb_label = tk.Label(thumb_box, bg=c["bg3"])
+            thumb_label.pack(fill="both", expand=True)
+        self._thumb_label = thumb_label
 
         info_txt = tk.Text(win, bg=c["bg2"], fg=c["text"],
                            font=F(12),
                            height=10, relief="flat", state="disabled",
                            padx=P(8), pady=P(4))
-        info_txt.pack(fill="both", expand=True, padx=P(12), pady=(0, P(12)))
+        info_txt.pack(fill="both", expand=True, padx=P(12),
+                      pady=(P(8) if not PIL_OK else 0, P(12)))
+
+        def set_text(text: str, head: str):
+            if not info_txt.winfo_exists():
+                return
+            head_lbl.config(text=head)
+            info_txt.config(state="normal")
+            info_txt.delete("1.0", "end")
+            info_txt.insert("end", text)
+            info_txt.config(state="disabled")
+
+        if not YT_DLP_OK:
+            set_text("この環境では動画情報の取得（yt-dlp Python パッケージ）が"
+                     "利用できません。", "動画情報を取得できません")
+            return
 
         def fetch():
-            if not YT_DLP_OK:
-                return
             try:
                 opts = self.dl._build_info_opts()
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -3170,20 +3269,22 @@ class App:
                 if not meta:
                     return
 
-                title     = meta.get("title", "不明")
-                duration  = meta.get("duration", 0)
-                uploader  = meta.get("uploader", "不明")
-                view_cnt  = meta.get("view_count", 0)
-                thumb_url = meta.get("thumbnail", "")
-                formats   = meta.get("formats", [])
+                title     = meta.get("title") or "不明"
+                duration  = int(meta.get("duration") or 0)
+                uploader  = meta.get("uploader") or "不明"
+                view_cnt  = meta.get("view_count")
+                thumb_url = meta.get("thumbnail") or ""
+                formats   = meta.get("formats") or []
 
                 dur_str = (f"{duration//3600}h{duration%3600//60}m{duration%60}s"
                            if duration else "不明")
+                view_str = f"{view_cnt:,}" if isinstance(view_cnt, int) \
+                    else "不明"
                 fmt_summary = "\n".join(
-                    f"  {f.get('format_id','?'):8s} "
-                    f"{f.get('ext','?'):6s} "
+                    f"  {str(f.get('format_id') or '?'):8s} "
+                    f"{str(f.get('ext') or '?'):6s} "
                     f"{f.get('height') or '?'}p "
-                    f"{f.get('vcodec','?')[:12]:12s} "
+                    f"{str(f.get('vcodec') or '?')[:12]:12s} "
                     f"{(f.get('filesize') or 0)//1024//1024}MB"
                     for f in reversed(formats)
                     if f.get("vcodec") and f.get("vcodec") != "none"
@@ -3193,22 +3294,14 @@ class App:
                     f"タイトル  : {title}\n"
                     f"投稿者    : {uploader}\n"
                     f"長さ      : {dur_str}\n"
-                    f"再生数    : {view_cnt:,}\n\n"
+                    f"再生数    : {view_str}\n\n"
                     f"--- 利用可能な動画フォーマット ---\n"
                     f"{fmt_summary or '取得できませんでした'}"
                 )
 
-                def update_ui():
-                    if not info_txt.winfo_exists():
-                        return
-                    info_txt.config(state="normal")
-                    info_txt.delete("1.0", "end")
-                    info_txt.insert("end", lines)
-                    info_txt.config(state="disabled")
+                self.root.after(0, lambda: set_text(lines, title))
 
-                self.root.after(0, update_ui)
-
-                if thumb_url:
+                if thumb_url and thumb_label is not None:
                     task_tmp = DownloadTask(url=url, idx=-1,
                                            thumbnail_url=thumb_url)
                     threading.Thread(
@@ -3216,13 +3309,8 @@ class App:
                         args=(task_tmp,), daemon=True).start()
 
             except Exception as e:
-                def show_err():
-                    if not info_txt.winfo_exists():
-                        return
-                    info_txt.config(state="normal")
-                    info_txt.insert("end", f"取得エラー: {e}")
-                    info_txt.config(state="disabled")
-                self.root.after(0, show_err)
+                err = f"取得エラー: {e}"
+                self.root.after(0, lambda: set_text(err, "動画情報を取得できません"))
 
         threading.Thread(target=fetch, daemon=True).start()
 
@@ -3234,16 +3322,19 @@ class App:
             with _ur.urlopen(task.thumbnail_url, timeout=10) as resp:
                 data = resp.read()
             img  = Image.open(_io.BytesIO(data))
-            img.thumbnail((200, 120))
-            photo = ImageTk.PhotoImage(img)
-            self.root.after(0, lambda: self._show_thumbnail(photo))
+            img.thumbnail((P(200), P(120)))
+            img.load()
+            # PhotoImage（Tk オブジェクト）はメインスレッドで作る
+            self.root.after(0, lambda: self._show_thumbnail(img))
         except Exception:
             pass
 
-    def _show_thumbnail(self, photo):
-        if hasattr(self, "_thumb_label") and self._thumb_label.winfo_exists():
-            self._thumb_label.configure(image=photo)
-            self._thumb_label.image = photo
+    def _show_thumbnail(self, img):
+        lbl = getattr(self, "_thumb_label", None)
+        if lbl is not None and lbl.winfo_exists():
+            photo = ImageTk.PhotoImage(img)
+            lbl.configure(image=photo)
+            lbl.image = photo
 
     # ══════════════════════════════════════════════════════
     #  全体進捗・ボタン状態
