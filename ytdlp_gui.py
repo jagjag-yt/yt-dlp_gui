@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         yt-dlp GUI v1.4.1  –  完全版 動画ダウンローダー          ║
+║         yt-dlp GUI v1.5.0  –  完全版 動画ダウンローダー          ║
 ║  pip install yt-dlp                                          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -60,7 +60,7 @@ IS_WIN = sys.platform == "win32"
 # ─────────────────────────────────────────────────────────────
 #  定数
 # ─────────────────────────────────────────────────────────────
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 APP_TITLE   = f"yt-dlp GUI v{APP_VERSION}"
 CFG_PATH    = Path.home() / ".ytdlp_gui_config.json"
 
@@ -204,6 +204,16 @@ def parse_speed_mbps(speed: str) -> float:
     if unit == "K": return val / 1024
     if unit == "G": return val * 1024
     return val
+
+def safe_filename(name: str) -> str:
+    """ファイル名に使えない文字・Windows の予約デバイス名を除去する"""
+    # 【セキュリティ】Windowsの予約デバイス名・先頭末尾スペース/ドットも除去
+    safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
+    safe = safe.strip(". ")
+    if re.match(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)', safe,
+                re.IGNORECASE):
+        safe = "_" + safe
+    return safe or "download"
 
 def parse_eta_sec(eta: str) -> int:
     """'01:23' '1:02:03' '45s' などを秒へ"""
@@ -349,6 +359,145 @@ def ytdlp_update_targets() -> List[tuple]:
     return targets
 
 # ══════════════════════════════════════════════════════════════
+#  yt-dlp 非対応サイト対応（ページ内の動画探索）
+# ══════════════════════════════════════════════════════════════
+
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/130.0.0.0 Safari/537.36")
+_PAGE_MAX_BYTES = 8 * 1024 * 1024
+
+def needs_impersonation(err: str) -> bool:
+    """ボット対策（Cloudflare 等）で拒否されたエラーか"""
+    e = (err or "").lower()
+    return ("anti-bot" in e or "cloudflare" in e
+            or "generic:impersonate" in e or "http error 403" in e)
+
+def is_unsupported_error(err: str) -> bool:
+    """yt-dlp が動画を見つけられなかった（=ページ探索を試す価値がある）エラーか"""
+    e = (err or "").lower()
+    if "drm" in e:
+        return False   # DRM 保護はどの手段でも保存しない
+    return any(k in e for k in (
+        "unsupported url", "no video formats found",
+        "unable to extract", "http error 403", "anti-bot"))
+
+# 動画として扱う拡張子（優先度順: ストリーミング → 動画ファイル → 音声）
+_MEDIA_EXT_RANK = {"m3u8": 0, "mpd": 1,
+                   "mp4": 2, "webm": 2, "mov": 2, "m4v": 2, "mkv": 2,
+                   "mp3": 3, "m4a": 3, "ogg": 3, "opus": 3}
+_MEDIA_URL_RE = re.compile(
+    r"""(?:https?:)?//[^\s"'<>()\\]+?\.(?:m3u8|mpd|mp4|webm|mov|m4v|mkv|mp3|m4a|ogg|opus)"""
+    r"""(?:\?[^\s"'<>()\\]*)?(?=["'\s<>()\\,;]|$)""", re.IGNORECASE)
+_META_VIDEO_RE = re.compile(
+    r"""<meta\b[^>]*?(?:property|name)\s*=\s*["'](?:og:video(?::url|:secure_url)?"""
+    r"""|twitter:player:stream)["'][^>]*>""", re.IGNORECASE)
+_TAG_SRC_RE = re.compile(
+    r"""<(?:video|source|audio)\b[^>]*?\s(?:data-)?src\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE)
+_CONTENT_RE = re.compile(r"""content\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_TITLE_RES = [
+    re.compile(r"""<meta\b[^>]*?property\s*=\s*["']og:title["'][^>]*?"""
+               r"""content\s*=\s*["']([^"']+)["']""", re.IGNORECASE),
+    re.compile(r"""<meta\b[^>]*?content\s*=\s*["']([^"']+)["'][^>]*?"""
+               r"""property\s*=\s*["']og:title["']""", re.IGNORECASE),
+    re.compile(r"""<title[^>]*>([^<]+)</title>""", re.IGNORECASE),
+]
+
+@dataclass
+class PageMedia:
+    urls:  List[str]
+    title: str = ""
+
+def extract_media_from_html(html: str, base_url: str) -> PageMedia:
+    """HTML から動画・音声の直リンクとページタイトルを取り出す"""
+    import html as _html
+    from urllib.parse import urljoin
+
+    # JSON 内のエスケープ（\/ や /）と HTML エンティティを戻す
+    text = (html.replace("\\/", "/")
+                .replace("\\u002F", "/").replace("\\u002f", "/")
+                .replace("\\u0026", "&"))
+    text = _html.unescape(text)
+
+    found: List[tuple] = []   # (優先度, 出現順, url)
+
+    def add(raw: str, boost: int = 0):
+        raw = (raw or "").strip()
+        if not raw or raw.startswith(("blob:", "data:", "javascript:")):
+            return
+        url = urljoin(base_url, raw)
+        if not url.startswith(("http://", "https://")):
+            return
+        m = re.search(r'\.(\w+)(?:\?|$)', url.split("#")[0])
+        ext = m.group(1).lower() if m else ""
+        rank = _MEDIA_EXT_RANK.get(ext)
+        if rank is None:
+            if not boost:
+                return
+            rank = 2   # <video src> など拡張子なしでも動画として扱う
+        if any(u == url for _, _, u in found):
+            return
+        found.append((rank - boost, len(found), url))
+
+    for tag in _META_VIDEO_RE.findall(text):
+        m = _CONTENT_RE.search(tag)
+        if m:
+            add(m.group(1), boost=1)
+    for src in _TAG_SRC_RE.findall(text):
+        add(src, boost=1)
+    for m in _MEDIA_URL_RE.finditer(text):
+        add(m.group(0))
+
+    title = ""
+    for rx in _TITLE_RES:
+        m = rx.search(text)
+        if m and m.group(1).strip():
+            title = re.sub(r'\s+', " ", m.group(1)).strip()
+            break
+
+    found.sort()
+    return PageMedia(urls=[u for _, _, u in found], title=title)
+
+def find_page_media(url: str, cookie_file: str = "") -> PageMedia:
+    """ページを取得して動画の直リンクを探す（ブラウザ相当の UA・Cookie 付き）"""
+    import urllib.request
+    import http.cookiejar
+
+    jar = http.cookiejar.MozillaCookieJar()
+    cf = (cookie_file or "").strip()
+    if cf and Path(cf).is_file():
+        try:
+            jar.load(cf, ignore_discard=True, ignore_expires=True)
+        except Exception:
+            pass
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar))
+    req = urllib.request.Request(url, headers={
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "ja,en;q=0.8",
+    })
+    with opener.open(req, timeout=20) as resp:
+        ctype = resp.headers.get("Content-Type", "")
+        final_url = resp.geturl()
+        # URL 自体が動画ファイルだった場合
+        if ctype.startswith(("video/", "audio/")) \
+                or "mpegurl" in ctype.lower():
+            return PageMedia(urls=[final_url])
+        data = resp.read(_PAGE_MAX_BYTES)
+        charset = resp.headers.get_content_charset()
+    if not charset:
+        m = re.search(rb'<meta[^>]+charset\s*=\s*["\']?([\w-]+)', data[:4096],
+                      re.IGNORECASE)
+        charset = m.group(1).decode("ascii", "ignore") if m else "utf-8"
+    try:
+        html = data.decode(charset, errors="replace")
+    except LookupError:
+        html = data.decode("utf-8", errors="replace")
+    return extract_media_from_html(html, final_url)
+
+# ══════════════════════════════════════════════════════════════
 #  暗号化保存（AES-256-GCM / PBKDF2）
 # ══════════════════════════════════════════════════════════════
 
@@ -452,6 +601,7 @@ class Config:
         "schedule_enable": False,
         "schedule_time":   "00:00",
         "encrypt_enable":  False,     # 暗号化保存（パスワードは保存しない）
+        "page_fallback":   True,      # yt-dlp 非対応サイトはページ内の動画を探す
         "onboarding_done": False,     # 初回オンボーディングバナー
         "dark_mode":       True,
         "recent_dirs":     [],
@@ -537,6 +687,10 @@ class DownloadTask:
     out_files:     List[str] = field(default_factory=list)  # 完成ファイル（暗号化用）
     last_error:    str       = ""      # yt-dlp が出した最後の ERROR 行
     removed:       bool      = False   # キューから削除された（未開始なら実行しない）
+    impersonate:   bool      = False   # ブラウザを偽装して実行する
+    page_searched: bool      = False   # ページ内の動画探索を試した
+    media_url:     str       = ""      # ページ内で見つけた動画の直リンク
+    page_title:    str       = ""      # 見つけたページのタイトル（ファイル名用）
     started:       Optional[datetime] = None
     finished:      Optional[datetime] = None
 
@@ -619,16 +773,12 @@ class Downloader:
 
         # ── 出力テンプレート ──────────────────────────────
         rename = (task.rename or "").strip()
+        if not rename and task.media_url and task.page_title:
+            # ページ内で見つけた直リンクはファイル名が意味を持たないことが
+            # 多いので、ページのタイトルで保存する
+            rename = task.page_title[:150]
         if rename:
-            # 【セキュリティ】Windowsの予約デバイス名・先頭末尾スペース/ドットも除去
-            safe = re.sub(r'[\\/:*?"<>|]', "_", rename)
-            safe = safe.strip(". ")
-            WIN_RESERVED = re.compile(
-                r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)', re.IGNORECASE)
-            if WIN_RESERVED.match(safe):
-                safe = "_" + safe
-            if not safe:
-                safe = "download"
+            safe = safe_filename(rename)
             outtmpl = os.path.join(save_dir, f"{safe}.%(ext)s")
         else:
             outtmpl = os.path.join(save_dir, "%(title).200s.%(ext)s")
@@ -743,7 +893,15 @@ class Downloader:
             "--newline",
         ]
 
-        cmd += [task.url]
+        # ── 非対応サイト向け ──────────────────────────────
+        if task.impersonate:
+            # 汎用抽出でブラウザを偽装する（curl_cffi が必要。公式の
+            # yt-dlp.exe には同梱。無い環境では警告を出して通常どおり動く）
+            cmd += ["--extractor-args", "generic:impersonate"]
+        if task.media_url:
+            cmd += ["--referer", task.url, task.media_url]
+        else:
+            cmd += [task.url]
         return cmd
 
     # ── yt-dlp オプション生成（Python API 用・情報取得専用）──
@@ -763,7 +921,8 @@ class Downloader:
         r'(?:\s+of\s+~?\s*[\d.]+\s*[KMGT]?i?B)?'
         r'(?:\s+at\s+(?:([\d.]+\s*[KMGT]?i?B/s)|Unknown\s+B/s))?'
         r'(?:\s+ETA\s+([\d:]+))?')
-    _ERROR_PATTERN = re.compile(r'^ERROR:\s*(.+)$')
+    _ERROR_PATTERN = re.compile(
+        r'^(?:ERROR|yt-dlp: error|yt_dlp\.utils\.\w+Error):\s*(.+)$')
 
     @staticmethod
     def _parse_progress(line: str, task: DownloadTask) -> bool:
@@ -879,69 +1038,16 @@ class Downloader:
 
                 task.last_error = ""
                 try:
-                    cmd = self._build_cmd(task)
-                    self.q.put(("log", f"[CMD] {' '.join(str(c) for c in cmd[:8])} ..."))
-
-                    # Windows では PYTHONUTF8=1 を渡して yt-dlp の出力を UTF-8 に強制
-                    env = os.environ.copy()
-                    env["PYTHONUTF8"]        = "1"
-                    env["PYTHONIOENCODING"]  = "utf-8:replace"
-                    env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
-
-                    # 文字化け対策: バイナリで受け取り、行ごとに
-                    # エンコーディングを自動判別してデコードする
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        env=env,
-                        creationflags=(subprocess.CREATE_NO_WINDOW
-                                       if IS_WIN else 0),
-                    )
-
-                    with self._lock:
-                        self._ydls[id(task)] = proc  # type: ignore[assignment]
-                    if stop.is_set():
-                        proc.kill()
-
-                    for raw_line in proc.stdout:  # type: ignore[union-attr]
-                        if stop.is_set():
-                            proc.kill()
-                            break
-                        line = decode_console_bytes(raw_line).rstrip()
-                        if not line:
-                            continue
-
-                        # yt-dlp の出力からタイトルを拾う
-                        if not task.title or task.title == task.url:
-                            m = re.search(
-                                r'Destination:\s*.+[\\/](.+?)(?:\.f\d+)?\.\w+\s*$',
-                                line)
-                            if m:
-                                task.title = m.group(1)
-                                self.q.put(("task_update", task))
-
-                        self._collect_out_file(line, task)
-
-                        em = self._ERROR_PATTERN.match(line)
-                        if em:
-                            task.last_error = em.group(1).strip()
-
-                        if self._parse_progress(line, task):
-                            self.q.put(("task_update", task))
-                        if "ERROR" in line or "WARNING" in line:
-                            self.q.put(("log", f"[WARN] {line}"))
-                        else:
-                            self.q.put(("log", f"[DBG] {line}"))
-
-                    proc.wait()
+                    rc = self._exec_ytdlp(task, self._build_cmd(task), stop)
+                    if rc != 0 and not stop.is_set():
+                        rc = self._try_fallbacks(task, stop, rc)
 
                     if stop.is_set():
                         task.state = TaskState.PAUSED
                         self.q.put(("task_update", task))
                         return
 
-                    if proc.returncode == 0:
+                    if rc == 0:
                         self._encrypt_outputs(task)
                         task.state    = TaskState.DONE
                         task.progress = 100.0
@@ -952,7 +1058,7 @@ class Downloader:
                     else:
                         raise RuntimeError(
                             task.last_error
-                            or f"yt-dlp 終了コード {proc.returncode}")
+                            or f"yt-dlp 終了コード {rc}")
 
                 except Exception as e:
                     msg = str(e)
@@ -968,9 +1074,128 @@ class Downloader:
                     self.q.put(("task_update", task))
                     self.q.put(("task_error",  task))
                     return
-                finally:
-                    with self._lock:
-                        self._ydls.pop(id(task), None)
+
+    # ── yt-dlp を1回実行 ──────────────────────────────────
+    def _exec_ytdlp(self, task: DownloadTask, cmd: List[str],
+                    stop: threading.Event) -> int:
+        """yt-dlp を実行して出力を処理し、終了コードを返す"""
+        self.q.put(("log", f"[CMD] {' '.join(str(c) for c in cmd[:8])} ..."))
+
+        # Windows では PYTHONUTF8=1 を渡して yt-dlp の出力を UTF-8 に強制
+        env = os.environ.copy()
+        env["PYTHONUTF8"]        = "1"
+        env["PYTHONIOENCODING"]  = "utf-8:replace"
+        env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
+
+        # 文字化け対策: バイナリで受け取り、行ごとに
+        # エンコーディングを自動判別してデコードする
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            creationflags=(subprocess.CREATE_NO_WINDOW
+                           if IS_WIN else 0),
+        )
+        try:
+            with self._lock:
+                self._ydls[id(task)] = proc  # type: ignore[assignment]
+            if stop.is_set():
+                proc.kill()
+
+            for raw_line in proc.stdout:  # type: ignore[union-attr]
+                if stop.is_set():
+                    proc.kill()
+                    break
+                line = decode_console_bytes(raw_line).rstrip()
+                if not line:
+                    continue
+
+                # yt-dlp の出力からタイトルを拾う
+                if not task.title or task.title == task.url:
+                    m = re.search(
+                        r'Destination:\s*.+[\\/](.+?)(?:\.f\d+)?\.\w+\s*$',
+                        line)
+                    if m:
+                        task.title = m.group(1)
+                        self.q.put(("task_update", task))
+
+                self._collect_out_file(line, task)
+
+                em = self._ERROR_PATTERN.match(line)
+                if em:
+                    task.last_error = em.group(1).strip()
+
+                if self._parse_progress(line, task):
+                    self.q.put(("task_update", task))
+                if "ERROR" in line or "WARNING" in line:
+                    self.q.put(("log", f"[WARN] {line}"))
+                else:
+                    self.q.put(("log", f"[DBG] {line}"))
+
+            proc.wait()
+            return proc.returncode
+        finally:
+            with self._lock:
+                self._ydls.pop(id(task), None)
+
+    # ── yt-dlp 非対応サイト向けの再試行 ──────────────────────
+    def _try_fallbacks(self, task: DownloadTask, stop: threading.Event,
+                       rc: int) -> int:
+        """
+        yt-dlp が失敗したときの追加の手段（タスクごとに各1回）:
+          1. Cloudflare 等のボット対策で弾かれた → ブラウザを偽装して再実行
+          2. 非対応サイト・動画が見つからない → ページ HTML から動画 URL を
+             探し、見つかった URL を yt-dlp に直接渡す
+        """
+        if not self.cfg["page_fallback"]:
+            return rc
+        err = orig_err = task.last_error
+        rc = self._try_fallbacks_inner(task, stop, rc, err)
+        if rc != 0 and not task.last_error:
+            task.last_error = orig_err
+        return rc
+
+    def _try_fallbacks_inner(self, task: DownloadTask, stop: threading.Event,
+                             rc: int, err: str) -> int:
+        if not task.impersonate and needs_impersonation(err):
+            task.impersonate = True
+            self.q.put(("log", "[INFO] ボット対策で拒否されたため、"
+                               "ブラウザを偽装して再試行します"))
+            task.last_error = ""
+            rc = self._exec_ytdlp(task, self._build_cmd(task), stop)
+            if rc == 0 or stop.is_set():
+                return rc
+            # ページ探索の要否は元のエラーで判断する
+            if task.last_error and not needs_impersonation(task.last_error):
+                err = task.last_error
+
+        if task.media_url or task.page_searched \
+                or not is_unsupported_error(err):
+            return rc
+        task.page_searched = True
+        self.q.put(("log", "[INFO] yt-dlp が対応していないため、"
+                           "ページ内の動画を探します"))
+        try:
+            found = find_page_media(task.url, self.cfg["cookie_file"])
+        except Exception as e:
+            self.q.put(("log", f"[WARN] ページを取得できませんでした: {e}"))
+            return rc
+        if not found.urls:
+            task.last_error = ("ページ内に動画が見つかりませんでした"
+                               f"（yt-dlp 非対応サイト）: {err}")
+            return rc
+        task.media_url = found.urls[0]
+        if found.title:
+            task.page_title = found.title
+            if not task.title or task.title == task.url:
+                task.title = found.title
+        extra = f"（ほか {len(found.urls) - 1} 件）" if len(found.urls) > 1 else ""
+        self.q.put(("log", f"[INFO] ページ内で動画を見つけました{extra}: "
+                           f"{task.media_url[:120]}"))
+        self.q.put(("task_update", task))
+        task.last_error = ""
+        return self._exec_ytdlp(task, self._build_cmd(task), stop)
 
 # ══════════════════════════════════════════════════════════════
 #  テーマ管理
@@ -1527,7 +1752,8 @@ class App:
         self._opts_vars: Dict[str, tk.BooleanVar] = {
             k: tk.BooleanVar(value=cfg[k]) for k in (
                 "playlist", "embed_thumbnail", "embed_subtitles",
-                "auto_subtitles", "ignore_errors", "skip_existing")}
+                "auto_subtitles", "ignore_errors", "skip_existing",
+                "page_fallback")}
         self._ts_var          = tk.StringVar(value=cfg["time_start"])
         self._te_var          = tk.StringVar(value=cfg["time_end"])
         self._concurrent_var  = tk.IntVar(value=cfg["concurrent"])
@@ -1945,6 +2171,18 @@ class App:
                          ("ignore_errors",  "エラーを無視して続行"),
                          ("skip_existing",  "ダウンロード済みをスキップ")]:
             self._toggle_row(sec, lbl, self._opts_vars[key])
+
+        # ── 非対応サイト ───────────────────────────────────
+        sec, _ = self._section(body, "非対応サイト", gap_top=P(20))
+        self._toggle_row(sec, "ページ内の動画を探してDL",
+                         self._opts_vars["page_fallback"])
+        tk.Label(sec,
+                 text="yt-dlp が対応していないサイトで失敗したとき、ブラウザを"
+                      "偽装して再試行し、ページ内の動画を探してダウンロードします"
+                      "（DRM 保護された動画は対象外）",
+                 bg=c["bg2"], fg=c["text3"], font=F(10),
+                 justify="left", wraplength=P(330)).pack(
+            anchor="w", pady=(P(6), 0))
 
         # ── 範囲ダウンロード ───────────────────────────────
         sec, _ = self._section(body, "範囲ダウンロード", gap_top=P(20))
@@ -2633,6 +2871,7 @@ class App:
             "mode", "video_fmt", "audio_fmt", "quality",
             "playlist", "embed_thumbnail", "embed_subtitles",
             "auto_subtitles", "ignore_errors", "skip_existing",
+            "page_fallback",
             "time_start", "time_end", "concurrent", "retries",
             "rate_limit", "post_action", "encrypt_enable")}
         presets = self.cfg["presets"]
@@ -2663,9 +2902,11 @@ class App:
         self._post_action_var.set(preset.get("post_action", "何もしない"))
         self._encrypt_var.set(preset.get("encrypt_enable", False))
         for key in ("playlist", "embed_thumbnail", "embed_subtitles",
-                    "auto_subtitles", "ignore_errors", "skip_existing"):
+                    "auto_subtitles", "ignore_errors", "skip_existing",
+                    "page_fallback"):
             if key in self._opts_vars:
-                self._opts_vars[key].set(preset.get(key, False))
+                self._opts_vars[key].set(
+                    preset.get(key, Config.DEFAULTS.get(key, False)))
         self._save_opts()
         self._log(f"プリセット「{name}」を読み込みました", "info")
 
