@@ -24,7 +24,7 @@ from pathlib import Path
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 APP_NAME    = "ytdlp_gui"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.4.0"
 SCRIPT_DIR  = Path(__file__).resolve().parent
 DIST_DIR    = SCRIPT_DIR / "dist" / APP_NAME
 BUILD_DIR   = SCRIPT_DIR / "build"
@@ -330,6 +330,13 @@ def finalize():
             shutil.copy2(src, DIST_DIR / readme)
             info(f"Copied: {readme}")
             break
+
+    # アイコンコピー（ウィンドウアイコンは実行時に EXE 隣の icon.ico を読む）
+    for icon in ("icon.ico", "icon.png"):
+        src = SCRIPT_DIR / icon
+        if src.exists():
+            shutil.copy2(src, DIST_DIR / icon)
+            info(f"Copied: {icon}")
 
     # 配布物の内容一覧
     print("\n  --- Distribution contents ---")
