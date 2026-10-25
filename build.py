@@ -24,7 +24,7 @@ from pathlib import Path
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 APP_NAME    = "ytdlp_gui"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 SCRIPT_DIR  = Path(__file__).resolve().parent
 DIST_DIR    = SCRIPT_DIR / "dist" / APP_NAME
 BUILD_DIR   = SCRIPT_DIR / "build"
