@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         yt-dlp GUI v1.5.0  –  完全版 動画ダウンローダー          ║
+║         yt-dlp GUI v1.5.1  –  完全版 動画ダウンローダー          ║
 ║  pip install yt-dlp                                          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -60,7 +60,7 @@ IS_WIN = sys.platform == "win32"
 # ─────────────────────────────────────────────────────────────
 #  定数
 # ─────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 APP_TITLE   = f"yt-dlp GUI v{APP_VERSION}"
 CFG_PATH    = Path.home() / ".ytdlp_gui_config.json"
 
@@ -777,11 +777,15 @@ class Downloader:
             # ページ内で見つけた直リンクはファイル名が意味を持たないことが
             # 多いので、ページのタイトルで保存する
             rename = task.page_title[:150]
+        # -o は yt-dlp の出力テンプレートとして解釈されるため、保存先や
+        # ファイル名に含まれる % は %% にエスケープする（ページタイトルの
+        # "%(id)s" などが展開されたり、"100%" でテンプレートが壊れないように）
+        tmpl_dir = save_dir.replace("%", "%%")
         if rename:
-            safe = safe_filename(rename)
-            outtmpl = os.path.join(save_dir, f"{safe}.%(ext)s")
+            safe = safe_filename(rename).replace("%", "%%")
+            outtmpl = os.path.join(tmpl_dir, f"{safe}.%(ext)s")
         else:
-            outtmpl = os.path.join(save_dir, "%(title).200s.%(ext)s")
+            outtmpl = os.path.join(tmpl_dir, "%(title).200s.%(ext)s")
         cmd += ["-o", outtmpl]
 
         # ── FFmpeg パス ───────────────────────────────────
@@ -898,10 +902,11 @@ class Downloader:
             # 汎用抽出でブラウザを偽装する（curl_cffi が必要。公式の
             # yt-dlp.exe には同梱。無い環境では警告を出して通常どおり動く）
             cmd += ["--extractor-args", "generic:impersonate"]
+        # URL は "--" の後ろに置き、オプションとして解釈されないようにする
         if task.media_url:
-            cmd += ["--referer", task.url, task.media_url]
+            cmd += ["--referer", task.url, "--", task.media_url]
         else:
-            cmd += [task.url]
+            cmd += ["--", task.url]
         return cmd
 
     # ── yt-dlp オプション生成（Python API 用・情報取得専用）──
